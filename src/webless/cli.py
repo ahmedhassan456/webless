@@ -1,4 +1,4 @@
-"""The `keyless-web` command.
+"""The `webless` command.
 
 A thin shell over `search` and `fetch`, so the package is usable from a
 terminal or a pipe without writing a script. Output is human readable by
@@ -22,10 +22,10 @@ from ._search import DEFAULT_LIMIT, search
 def build_parser() -> argparse.ArgumentParser:
     """Assemble the argument parser for both subcommands."""
     parser = argparse.ArgumentParser(
-        prog="keyless-web",
+        prog="webless",
         description="Search the web and fetch pages, with no API keys.",
     )
-    parser.add_argument("--version", action="version", version=f"keyless-web {__version__}")
+    parser.add_argument("--version", action="version", version=f"webless {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     find = sub.add_parser("search", help="search the web")

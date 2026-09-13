@@ -1,4 +1,4 @@
-"""keyless-web: web search and page fetching with no API keys.
+"""webless: web search and page fetching with no API keys.
 
 Two calls. `search` queries several public search engines at once and fuses
 their rankings; `fetch` retrieves a URL and returns its readable content as
@@ -7,7 +7,7 @@ and no per-request quota to manage.
 
 Example:
     import asyncio
-    from keyless_web import search, fetch
+    from webless import search, fetch
 
     async def main():
         result = await search("reciprocal rank fusion")
@@ -20,7 +20,7 @@ Example:
     asyncio.run(main())
 
 The same two calls exist as `search_sync` and `fetch_sync` for code with no
-event loop, and as a `keyless-web` command on the terminal.
+event loop, and as a `webless` command on the terminal.
 """
 
 from ._engines import (

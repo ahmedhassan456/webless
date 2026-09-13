@@ -1,4 +1,4 @@
-"""Tests for keyless-web.
+"""Tests for webless.
 
 Nothing here touches the network. Engines are exercised against captured
 result markup and `fetch_url` is replaced wherever a call would otherwise make
@@ -15,7 +15,7 @@ import base64
 
 import pytest
 
-from keyless_web import (
+from webless import (
     USER_AGENTS,
     BingEngine,
     DuckDuckGoEngine,
@@ -39,14 +39,14 @@ from keyless_web import (
     search,
     search_sync,
 )
-from keyless_web._engines import (
+from webless._engines import (
     apply_domain_filters,
     decode_bing_url,
     search_web,
     unwrap_redirect,
 )
-from keyless_web._http import dedup_key, next_user_agent
-from keyless_web.cli import main
+from webless._http import dedup_key, next_user_agent
+from webless.cli import main
 
 DDG_HTML = """
 <html><body>
@@ -148,7 +148,7 @@ async def test_engine_refuses_a_challenge_status(monkeypatch) -> None:
             content_type="text/html",
         )
 
-    monkeypatch.setattr("keyless_web._engines.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._engines.fetch_url", fake_fetch)
 
     with pytest.raises(WebError) as excinfo:
         await MojeekEngine().search("anything", 5, 5.0)
@@ -161,7 +161,7 @@ async def test_soft_block_is_reported_as_a_failure(monkeypatch) -> None:
     async def fake_fetch(url, **kwargs):
         return html_response(url, "<html><body><h1>Mojeek</h1></body></html>")
 
-    monkeypatch.setattr("keyless_web._engines.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._engines.fetch_url", fake_fetch)
 
     result = await search(" anything ", engines=(MojeekEngine,))
     assert not result.ok
@@ -306,7 +306,7 @@ async def test_wide_adds_the_long_tail_engines(monkeypatch) -> None:
         asked.extend(cls().name for cls in kwargs["engines"])
         return await search_web(query, engines=())
 
-    monkeypatch.setattr("keyless_web._search.search_web", spy)
+    monkeypatch.setattr("webless._search.search_web", spy)
     await search("anything", wide=True)
     assert "marginalia" in asked and "hackernews" in asked
 
@@ -315,7 +315,7 @@ async def test_fetch_returns_markdown_without_the_chrome(monkeypatch) -> None:
     async def fake_fetch(url, **kwargs):
         return html_response("https://site.test/docs/page")
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
 
     page = await fetch("site.test/docs/page")
     assert page.title == "Sample Page"
@@ -334,7 +334,7 @@ async def test_fetch_pages_a_long_body(monkeypatch) -> None:
             content_type="text/plain",
         )
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
 
     first = await fetch("https://site.test/long", max_chars=40)
     assert len(first) == 40
@@ -352,7 +352,7 @@ async def test_fetch_reports_a_redirect(monkeypatch) -> None:
             text=ARTICLE_HTML, content_type="text/html",
         )
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
 
     page = await fetch("https://site.test/old")
     assert page.redirected
@@ -441,7 +441,7 @@ def test_sync_wrappers_run_their_own_loop(monkeypatch) -> None:
     async def fake_fetch(url, **kwargs):
         return html_response("https://site.test/x")
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
     assert "# Widgets" in fetch_sync("https://site.test/x").content
 
 
@@ -453,7 +453,7 @@ async def test_sync_wrappers_refuse_to_run_inside_a_loop() -> None:
 
 def test_cli_prints_the_ranking(monkeypatch, capsys) -> None:
     async def fake_search(query, **kwargs):
-        from keyless_web._search import SearchResult
+        from webless._search import SearchResult
 
         return SearchResult(
             query=query,
@@ -469,7 +469,7 @@ def test_cli_prints_the_ranking(monkeypatch, capsys) -> None:
             failed={"mojeek": "blocked"},
         )
 
-    monkeypatch.setattr("keyless_web.cli.search", fake_search)
+    monkeypatch.setattr("webless.cli.search", fake_search)
 
     assert main(["search", "async", "io"]) == 0
     captured = capsys.readouterr()
@@ -481,11 +481,11 @@ def test_cli_prints_the_ranking(monkeypatch, capsys) -> None:
 
 def test_cli_exits_nonzero_when_every_engine_failed(monkeypatch, capsys) -> None:
     async def fake_search(query, **kwargs):
-        from keyless_web._search import SearchResult
+        from webless._search import SearchResult
 
         return SearchResult(query=query, hits=[], failed={"bing": "blocked"})
 
-    monkeypatch.setattr("keyless_web.cli.search", fake_search)
+    monkeypatch.setattr("webless.cli.search", fake_search)
     assert main(["search", "anything"]) == 1
 
 
@@ -493,7 +493,7 @@ def test_cli_fetch_prints_the_page(monkeypatch, capsys) -> None:
     async def fake_fetch(url, **kwargs):
         return html_response("https://site.test/x")
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
     assert main(["fetch", "https://site.test/x"]) == 0
     assert "# Widgets" in capsys.readouterr().out
 
@@ -502,6 +502,6 @@ def test_cli_turns_a_web_error_into_a_message(monkeypatch, capsys) -> None:
     async def fake_fetch(url, **kwargs):
         raise WebError("https://site.test/x returned HTTP 404.", status=404)
 
-    monkeypatch.setattr("keyless_web._fetch.fetch_url", fake_fetch)
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
     assert main(["fetch", "https://site.test/x"]) == 1
     assert "404" in capsys.readouterr().err

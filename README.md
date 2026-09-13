@@ -1,14 +1,14 @@
-# keyless-web
+# webless
 
 Web search and page fetching for Python, with **no API keys**.
 
-`pip install keyless-web` and the first call works. There is no account to
+`pip install webless` and the first call works. There is no account to
 create, no key to configure, no quota to track, and no paid tier — every
 back end is a public endpoint.
 
 ```python
 import asyncio
-from keyless_web import search, fetch
+from webless import search, fetch
 
 async def main():
     result = await search("reciprocal rank fusion")
@@ -27,7 +27,7 @@ same arguments.
 ## Install
 
 ```bash
-pip install keyless-web
+pip install webless
 ```
 
 The only dependency is `httpx`. HTML parsing, content extraction, and Markdown
@@ -159,10 +159,10 @@ Response bodies are capped, and redirect chains are limited to five hops.
 ## Command line
 
 ```bash
-keyless-web search "structured concurrency python" -n 5
-keyless-web search "rust async traits" --wide --allow rust-lang.org
-keyless-web fetch https://peps.python.org/pep-3156/ > pep.md
-keyless-web fetch https://api.github.com/repos/python/cpython --json | jq .status
+webless search "structured concurrency python" -n 5
+webless search "rust async traits" --wide --allow rust-lang.org
+webless fetch https://peps.python.org/pep-3156/ > pep.md
+webless fetch https://api.github.com/repos/python/cpython --json | jq .status
 ```
 
 `--json` on either subcommand prints the full record, so it composes with
@@ -182,7 +182,7 @@ keyless-web fetch https://api.github.com/repos/python/cpython --json | jq .statu
 Pick your own set with `engines=`:
 
 ```python
-from keyless_web import search, DuckDuckGoEngine, MojeekEngine
+from webless import search, DuckDuckGoEngine, MojeekEngine
 
 result = await search("query", engines=(DuckDuckGoEngine, MojeekEngine))
 ```
