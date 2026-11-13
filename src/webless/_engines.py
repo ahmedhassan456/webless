@@ -1,11 +1,18 @@
 """The keyless search back ends and the fusion that merges them.
 
 Each engine here is a public endpoint that answers without credentials: three
-scrape a normal results page, three read a public JSON or OpenSearch API. None
-of them is trusted to be up. `search_web` queries them concurrently, keeps
-whatever answers inside the deadline, and fuses the surviving rankings, so an
-engine that is blocked, rate limited, or simply slow costs recall rather than
-the whole call.
+scrape a normal results page, three read a public JSON API. None of them is
+trusted to be up. `search_web` queries them concurrently, keeps whatever
+answers inside the deadline, and fuses the surviving rankings, so an engine
+that is blocked, rate limited, or simply slow costs recall rather than the
+whole call.
+
+An engine is not trusted to say when it is blocked, either. A scraped engine
+that has flagged a client may answer 200 with a page of plausible results
+that have nothing to do with the query; those are caught by checking how many
+of them mention the query at all (`looks_like_decoy`). And an engine that was
+just blocked is likely to stay blocked for a while, so `ENGINE_HEALTH` pauses
+it for a few minutes rather than paying its timeout on every call.
 
 Fusion is Reciprocal Rank Fusion: a result's score is the sum of ``1 / (k +
 rank)`` over the engines that returned it. Rank is all it needs, which is the
@@ -19,14 +26,37 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import html
 import re
+import time
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, quote_plus, urlsplit
+from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
 from ._html import parse_html
-from ._http import Response, WebError, dedup_key, fetch_url, host_of, normalize_url
+from ._http import (
+    BLOCKED_STATUSES,
+    Response,
+    WebError,
+    dedup_key,
+    fetch_url,
+    host_of,
+    normalize_url,
+)
 
 RRF_K = 60
+
+# A hit is on topic when it mentions at least half the query's content words,
+# and a scraped engine is serving decoys when fewer than a fifth of its hits
+# are on topic. Measured live, an unblocked engine sits at or near 100% and
+# Bing's decoy pages at 0%, so the line has wide margins on both sides.
+ON_TOPIC_ALIGNMENT = 0.5
+DECOY_ON_TOPIC_SHARE = 0.2
+DECOY_MIN_HITS = 3
+
+# A block pauses an engine at once; other failures (timeouts, network errors)
+# only after several in a row, since one slow answer says little.
+BLOCK_COOLDOWN_S = 300.0
+FAILURES_BEFORE_COOLDOWN = 3
 
 STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does",
@@ -73,7 +103,16 @@ def unwrap_redirect(href: str) -> str:
     return target if target.lower().startswith(("http://", "https://")) else href
 
 
-def soft_block(engine: str) -> WebError:
+class EngineBlocked(WebError):
+    """An engine refused to answer: a challenge, a soft block, or decoys.
+
+    Kept distinct from other failures because it predicts the next request:
+    an engine that has flagged this client tends to keep refusing it for a
+    while, whereas a timeout or a dropped connection usually does not repeat.
+    """
+
+
+def soft_block(engine: str) -> EngineBlocked:
     """The error raised when a results page parses to nothing.
 
     An engine that answers 200 with no result rows has almost always served a
@@ -81,7 +120,25 @@ def soft_block(engine: str) -> WebError:
     engine failure is more honest than reporting zero results, and it keeps a
     silently blocked engine from looking like one that simply found nothing.
     """
-    return WebError(f"{engine} returned a page with no results, likely a soft block.")
+    return EngineBlocked(f"{engine} returned a page with no results, likely a soft block.")
+
+
+def decoy_block(engine: str) -> EngineBlocked:
+    """The error raised when a results page answers some other question.
+
+    The quieter form of a soft block: rather than an empty page, the engine
+    serves a full page of real-looking results -- for "reciprocal rank
+    fusion", Outlook login pages -- that ignore the query. Counting that as a
+    success would credit the engine with an answer it never gave.
+    """
+    return EngineBlocked(f"{engine} returned off-topic results, likely a decoy block.")
+
+
+def is_block(exc: BaseException) -> bool:
+    """Whether a failure means the engine is refusing this client."""
+    if isinstance(exc, EngineBlocked):
+        return True
+    return isinstance(exc, WebError) and exc.status in BLOCKED_STATUSES
 
 
 def _clean(text: str) -> str:
@@ -103,6 +160,12 @@ class Engine:
 
     name: str
 
+    # Whether this engine can answer a flagged client with decoy results.
+    # True for engines that scrape a results page, since that is how they get
+    # blocked silently. False for search APIs, whose loose matches are real
+    # answers to the query -- just weak ones, which ranking already demotes.
+    serves_decoys: bool = False
+
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         """Return this engine's ranked results for `query`."""
         raise NotImplementedError
@@ -119,7 +182,7 @@ class Engine:
         """
         response = await fetch_url(url, timeout=timeout, headers=headers)
         if response.status != 200:
-            raise WebError(
+            raise EngineBlocked(
                 f"{self.name} answered HTTP {response.status}, which is a "
                 "challenge page rather than results.",
                 status=response.status,
@@ -136,6 +199,7 @@ class DuckDuckGoEngine(Engine):
     """
 
     name = "duckduckgo"
+    serves_decoys = True
 
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         endpoints = (
@@ -178,6 +242,7 @@ class MojeekEngine(Engine):
     """
 
     name = "mojeek"
+    serves_decoys = True
 
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         url = f"https://www.mojeek.com/search?q={quote_plus(query)}&safe=0"
@@ -209,6 +274,7 @@ class BingEngine(Engine):
     """
 
     name = "bing"
+    serves_decoys = True
 
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         url = (
@@ -293,37 +359,56 @@ def decode_bing_url(href: str) -> str:
 
 
 class WikipediaEngine(Engine):
-    """Wikipedia's OpenSearch API, as an encyclopedic anchor.
+    """Wikipedia's full-text search API, as an encyclopedic anchor.
 
     It answers only when the query names a real subject, which is what makes
     it useful in fusion: it breaks ties toward the topic a word denotes rather
     than the company that happens to own the domain.
+
+    Full-text search rather than OpenSearch, which only matches the start of
+    article titles and so found nothing for most multi-word queries.
     """
 
     name = "wikipedia"
 
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         url = (
-            "https://en.wikipedia.org/w/api.php?action=opensearch&format=json"
-            f"&namespace=0&limit={min(max(limit, 1), 20)}&search={quote_plus(query)}"
+            "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json"
+            f"&srprop=snippet&srlimit={min(max(limit, 1), 50)}&srsearch={quote_plus(query)}"
         )
         response = await self._get(url, timeout, headers={"Accept": "application/json"})
         try:
             body = json.loads(response.text)
         except json.JSONDecodeError:
             return []
-        if not isinstance(body, list) or len(body) < 4:
+        found = body.get("query") if isinstance(body, dict) else None
+        rows = found.get("search") if isinstance(found, dict) else None
+        if not isinstance(rows, list):
             return []
-        titles, snippets, urls = body[1], body[2], body[3]
         hits: list[SearchHit] = []
-        for index, title in enumerate(titles[:limit]):
-            if index >= len(urls):
-                break
-            snippet = snippets[index] if index < len(snippets) else ""
-            hit = _hit(str(title), str(urls[index]), str(snippet), self.name)
+        for row in rows[:limit]:
+            if not isinstance(row, dict) or not row.get("title"):
+                continue
+            title = str(row["title"])
+            hit = _hit(
+                title,
+                wikipedia_url(title),
+                strip_tags(str(row.get("snippet", ""))),
+                self.name,
+            )
             if hit is not None:
                 hits.append(hit)
         return hits
+
+
+def wikipedia_url(title: str) -> str:
+    """The article URL for a Wikipedia page title."""
+    return "https://en.wikipedia.org/wiki/" + quote(title.replace(" ", "_"), safe="/:(),'!_")
+
+
+def strip_tags(fragment: str) -> str:
+    """Plain text from an HTML fragment such as a highlighted API snippet."""
+    return html.unescape(re.sub(r"<[^>]+>", "", fragment))
 
 
 class MarginaliaEngine(Engine):
@@ -498,6 +583,87 @@ def rank_by_relevance(query: str, hits: list[SearchHit]) -> list[SearchHit]:
     return sorted(hits, key=lambda h: (-h.score, h.title.lower()))
 
 
+def looks_like_decoy(query: str, hits: list[SearchHit]) -> bool:
+    """Whether a page of results ignores the query it was asked.
+
+    A hit counts as on topic when it mentions at least half the query's
+    content words; the page is a decoy when almost none of its hits are. Too
+    few hits, or a query with no content words, is not enough to judge, and
+    those are let through.
+    """
+    terms = query_terms(query)
+    if not terms or len(hits) < DECOY_MIN_HITS:
+        return False
+    on_topic = sum(1 for hit in hits if alignment(terms, hit) >= ON_TOPIC_ALIGNMENT)
+    return on_topic / len(hits) < DECOY_ON_TOPIC_SHARE
+
+
+@dataclass(slots=True)
+class _EngineState:
+    failures: int = 0
+    paused_until: float = 0.0
+    reason: str = ""
+
+
+class EngineHealth:
+    """Remembers which engines are failing, and pauses them for a while.
+
+    A blocked engine does not unblock between one call and the next, so
+    querying it again costs a full request -- often a full timeout -- for a
+    known answer, and keeps reminding the engine that this client exists. A
+    block pauses an engine at once; any other failure pauses it after
+    `failures_before_cooldown` in a row. One success clears the record.
+
+    State lives in the process, shared by every search in it. The module-level
+    `ENGINE_HEALTH` is the instance `search` uses; call its `reset()` to try
+    every engine again straight away.
+    """
+
+    def __init__(
+        self,
+        *,
+        cooldown: float = BLOCK_COOLDOWN_S,
+        failures_before_cooldown: int = FAILURES_BEFORE_COOLDOWN,
+        clock=time.monotonic,
+    ) -> None:
+        self.cooldown = cooldown
+        self.failures_before_cooldown = failures_before_cooldown
+        self._clock = clock
+        self._states: dict[str, _EngineState] = {}
+
+    def paused(self, name: str) -> str | None:
+        """Why `name` is being skipped, or None when it should be queried."""
+        state = self._states.get(name)
+        if state is None:
+            return None
+        remaining = state.paused_until - self._clock()
+        if remaining <= 0:
+            return None
+        return f"skipped for another {remaining:.0f}s after a recent failure: {state.reason}"
+
+    def record_success(self, name: str) -> None:
+        """Clear `name`'s failure record."""
+        self._states.pop(name, None)
+
+    def record_failure(self, name: str, reason: str, *, blocked: bool) -> None:
+        """Count a failure, pausing `name` if it was blocked or keeps failing."""
+        state = self._states.setdefault(name, _EngineState())
+        state.failures += 1
+        state.reason = reason
+        if blocked or state.failures >= self.failures_before_cooldown:
+            state.paused_until = self._clock() + self.cooldown
+
+    def reset(self, name: str | None = None) -> None:
+        """Forget one engine's failures, or every engine's."""
+        if name is None:
+            self._states.clear()
+        else:
+            self._states.pop(name, None)
+
+
+ENGINE_HEALTH = EngineHealth()
+
+
 def apply_domain_filters(
     hits: list[SearchHit],
     allowed: list[str] | None,
@@ -539,6 +705,7 @@ async def search_web(
     timeout: float = 12.0,
     allowed_domains: list[str] | None = None,
     blocked_domains: list[str] | None = None,
+    health: EngineHealth | None = ENGINE_HEALTH,
 ) -> SearchReport:
     """Query every engine concurrently and return the fused ranking.
 
@@ -546,32 +713,53 @@ async def search_web(
     failure is recorded against its name and the rest of the results stand.
     Only when every engine fails does the caller get an empty ranking with the
     reasons attached.
+
+    Engines `health` has paused are skipped and listed in `failed` -- unless
+    every engine is paused, in which case all of them are tried anyway, since
+    a long shot beats a certain empty answer. Pass `health=None` to query
+    every engine regardless.
     """
     instances = [cls() for cls in engines]
     per_engine = max(limit, 10)
+    report = SearchReport(hits=[])
 
-    async def run(engine: Engine) -> tuple[str, list[SearchHit] | str]:
+    skipped = {
+        e.name: reason
+        for e in instances
+        if health is not None and (reason := health.paused(e.name)) is not None
+    }
+    active = [e for e in instances if e.name not in skipped]
+    if not active:
+        active, skipped = instances, {}
+    report.failed.update(skipped)
+
+    async def run(engine: Engine) -> tuple[str, list[SearchHit] | str, bool]:
         try:
             hits = await asyncio.wait_for(
                 engine.search(query, per_engine, timeout), timeout=timeout + 2
             )
-            return engine.name, hits
         except asyncio.TimeoutError:
-            return engine.name, f"timed out after {timeout:g}s"
+            return engine.name, f"timed out after {timeout:g}s", False
         except WebError as exc:
-            return engine.name, str(exc)
+            return engine.name, str(exc), is_block(exc)
         except Exception as exc:
-            return engine.name, f"{type(exc).__name__}: {exc}"
+            return engine.name, f"{type(exc).__name__}: {exc}", False
+        if engine.serves_decoys and looks_like_decoy(query, hits):
+            return engine.name, str(decoy_block(engine.name)), True
+        return engine.name, hits, False
 
-    outcomes = await asyncio.gather(*(run(e) for e in instances))
+    outcomes = await asyncio.gather(*(run(e) for e in active))
 
     ranked: list[list[SearchHit]] = []
-    report = SearchReport(hits=[])
-    for name, outcome in outcomes:
+    for name, outcome, blocked in outcomes:
         if isinstance(outcome, str):
             report.failed[name] = outcome
+            if health is not None:
+                health.record_failure(name, outcome, blocked=blocked)
             continue
         report.succeeded.append(name)
+        if health is not None:
+            health.record_success(name)
         if outcome:
             ranked.append(outcome)
 
@@ -582,6 +770,9 @@ async def search_web(
 
 __all__ = [
     "Engine",
+    "EngineBlocked",
+    "EngineHealth",
+    "ENGINE_HEALTH",
     "SearchHit",
     "SearchReport",
     "GENERAL_ENGINES",
@@ -598,6 +789,10 @@ __all__ = [
     "rank_by_relevance",
     "query_terms",
     "alignment",
+    "looks_like_decoy",
+    "is_block",
+    "soft_block",
+    "decoy_block",
     "apply_domain_filters",
     "decode_bing_url",
     "unwrap_redirect",

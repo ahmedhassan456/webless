@@ -16,20 +16,27 @@ import base64
 import pytest
 
 from webless import (
+    ENGINE_HEALTH,
     USER_AGENTS,
     BingEngine,
     DuckDuckGoEngine,
+    Engine,
+    EngineBlocked,
+    EngineCheck,
+    EngineHealth,
     MojeekEngine,
     Response,
     SearchHit,
     WebError,
     WikipediaEngine,
     alignment,
+    doctor,
     fetch,
     fetch_sync,
     fuse,
     html_to_markdown,
     host_of,
+    looks_like_decoy,
     normalize_url,
     page_title,
     parse_html,
@@ -43,9 +50,10 @@ from webless._engines import (
     apply_domain_filters,
     decode_bing_url,
     search_web,
+    soft_block,
     unwrap_redirect,
 )
-from webless._http import dedup_key, next_user_agent
+from webless._http import _shared_client, aclose, dedup_key, next_user_agent
 from webless.cli import main
 
 DDG_HTML = """
@@ -178,14 +186,16 @@ def test_bing_reads_the_rss_view() -> None:
     assert hits[0].engines == ["bing"]
 
 
-def test_wikipedia_parses_opensearch() -> None:
+def test_wikipedia_parses_full_text_search() -> None:
     async def run() -> list[SearchHit]:
         engine = WikipediaEngine()
 
         async def fake_get(url, timeout, headers=None):
+            assert "list=search" in url and "srsearch=write-ahead+logging" in url
             body = (
-                '["asyncio",["Asyncio"],["Python library"],'
-                '["https://en.wikipedia.org/wiki/Asyncio"]]'
+                '{"query":{"search":[{"title":"Write-ahead logging",'
+                '"snippet":"In <span class=\\"searchmatch\\">logging</span> &amp; recovery"},'
+                '{"title":"AC/DC (band)","snippet":""}]}}'
             )
             return Response(
                 url=url, final_url=url, status=200, text=body,
@@ -193,9 +203,12 @@ def test_wikipedia_parses_opensearch() -> None:
             )
 
         engine._get = fake_get
-        return await engine.search("asyncio", 5, 5.0)
+        return await engine.search("write-ahead logging", 5, 5.0)
 
-    assert asyncio.run(run())[0].url == "https://en.wikipedia.org/wiki/Asyncio"
+    hits = asyncio.run(run())
+    assert hits[0].url == "https://en.wikipedia.org/wiki/Write-ahead_logging"
+    assert hits[0].snippet == "In logging & recovery"
+    assert hits[1].url == "https://en.wikipedia.org/wiki/AC/DC_(band)"
 
 
 def test_fusion_rewards_agreement_across_engines() -> None:
@@ -505,3 +518,236 @@ def test_cli_turns_a_web_error_into_a_message(monkeypatch, capsys) -> None:
     monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
     assert main(["fetch", "https://site.test/x"]) == 1
     assert "404" in capsys.readouterr().err
+
+
+# -- decoys, cooldowns, the shared client, and doctor ------------------------
+
+
+def _hits(engine: str, *titles: str) -> list[SearchHit]:
+    return [
+        SearchHit(title=t, url=f"https://{engine}.test/{i}", engines=[engine])
+        for i, t in enumerate(titles)
+    ]
+
+
+DECOYS = ("Outlook sign in", "Outlook mail", "Microsoft account", "Office 365")
+ON_TOPIC = ("Reciprocal rank fusion", "Rank fusion in search", "RRF: reciprocal rank")
+
+
+def test_decoy_check_separates_off_topic_pages_from_answers() -> None:
+    query = "reciprocal rank fusion"
+    assert looks_like_decoy(query, _hits("x", *DECOYS))
+    assert not looks_like_decoy(query, _hits("x", *ON_TOPIC))
+    # Too few hits, or nothing in the query to check against, is no evidence.
+    assert not looks_like_decoy(query, _hits("x", *DECOYS[:2]))
+    assert not looks_like_decoy("how is it", _hits("x", *DECOYS))
+
+
+async def test_a_scraped_engine_serving_decoys_is_reported_as_blocked() -> None:
+    class Scraped(Engine):
+        name = "scraped"
+        serves_decoys = True
+
+        async def search(self, query, limit, timeout):
+            return _hits(self.name, *DECOYS)
+
+    class Honest(Engine):
+        name = "honest"
+        serves_decoys = True
+
+        async def search(self, query, limit, timeout):
+            return _hits(self.name, *ON_TOPIC)
+
+    result = await search("reciprocal rank fusion", engines=(Scraped, Honest))
+    assert result.succeeded == ["honest"]
+    assert "decoy" in result.failed["scraped"]
+    assert all("scraped" not in hit.engines for hit in result)
+
+
+async def test_a_search_api_matching_loosely_is_not_called_a_decoy() -> None:
+    """An API's weak matches are real answers; ranking demotes them."""
+
+    class Loose(Engine):
+        name = "loose"
+
+        async def search(self, query, limit, timeout):
+            return _hits(self.name, *DECOYS)
+
+    result = await search("reciprocal rank fusion", engines=(Loose,))
+    assert result.succeeded == ["loose"]
+
+
+def test_engine_health_pauses_on_a_block_and_expires() -> None:
+    now = [0.0]
+    health = EngineHealth(cooldown=300, failures_before_cooldown=3, clock=lambda: now[0])
+
+    health.record_failure("bing", "bing returned off-topic results", blocked=True)
+    assert "off-topic" in health.paused("bing")
+    now[0] = 299
+    assert health.paused("bing") is not None
+    now[0] = 301
+    assert health.paused("bing") is None
+
+
+def test_engine_health_tolerates_isolated_ordinary_failures() -> None:
+    now = [0.0]
+    health = EngineHealth(cooldown=300, failures_before_cooldown=3, clock=lambda: now[0])
+
+    health.record_failure("ddg", "timed out", blocked=False)
+    health.record_failure("ddg", "timed out", blocked=False)
+    assert health.paused("ddg") is None
+    health.record_success("ddg")
+    health.record_failure("ddg", "timed out", blocked=False)
+    health.record_failure("ddg", "timed out", blocked=False)
+    assert health.paused("ddg") is None, "a success resets the count"
+    health.record_failure("ddg", "timed out", blocked=False)
+    assert health.paused("ddg") is not None
+
+
+async def test_a_blocked_engine_is_skipped_on_the_next_search() -> None:
+    calls: list[str] = []
+
+    class Blocked(Engine):
+        name = "blocked"
+
+        async def search(self, query, limit, timeout):
+            calls.append(self.name)
+            raise WebError("https://blocked.test returned HTTP 429.", status=429)
+
+    class Good(Engine):
+        name = "good"
+
+        async def search(self, query, limit, timeout):
+            calls.append(self.name)
+            return _hits(self.name, "Anything at all")
+
+    await search("anything", engines=(Blocked, Good))
+    second = await search("anything", engines=(Blocked, Good))
+
+    assert calls == ["blocked", "good", "good"]
+    assert second.failed["blocked"].startswith("skipped for another")
+    assert "429" in second.failed["blocked"]
+
+    ENGINE_HEALTH.reset("blocked")
+    await search("anything", engines=(Blocked, Good))
+    assert calls.count("blocked") == 2
+
+
+async def test_paused_engines_are_tried_when_nothing_else_is_left() -> None:
+    calls: list[str] = []
+
+    class Flaky(Engine):
+        name = "flaky"
+
+        async def search(self, query, limit, timeout):
+            calls.append(self.name)
+            if len(calls) == 1:
+                raise WebError("https://flaky.test returned HTTP 403.", status=403)
+            return _hits(self.name, "Anything at all")
+
+    await search("anything", engines=(Flaky,))
+    result = await search("anything", engines=(Flaky,))
+    assert calls == ["flaky", "flaky"]
+    assert result.ok
+
+
+async def test_health_none_queries_every_engine() -> None:
+    calls: list[str] = []
+
+    class Blocked(Engine):
+        name = "blocked"
+
+        async def search(self, query, limit, timeout):
+            calls.append(self.name)
+            raise WebError("https://blocked.test returned HTTP 403.", status=403)
+
+    ENGINE_HEALTH.record_failure("blocked", "403", blocked=True)
+    await search_web("anything", engines=(Blocked,), health=None)
+    assert calls == ["blocked"]
+
+
+async def test_requests_on_one_loop_share_a_client() -> None:
+    first = _shared_client()
+    assert _shared_client() is first
+    await aclose()
+    assert first.is_closed
+    assert _shared_client() is not first
+    await aclose()
+
+
+def test_sync_wrappers_close_the_client_they_opened(monkeypatch) -> None:
+    opened = []
+
+    async def fake_fetch(url, **kwargs):
+        opened.append(_shared_client())
+        return html_response("https://site.test/x")
+
+    monkeypatch.setattr("webless._fetch.fetch_url", fake_fetch)
+    fetch_sync("https://site.test/x")
+    assert opened[0].is_closed
+
+
+async def test_doctor_classifies_each_way_an_engine_breaks() -> None:
+    def engine(name, outcome, *, decoys=False):
+        async def run(self, query, limit, timeout):
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        return type(name, (Engine,), {"name": name, "serves_decoys": decoys, "search": run})
+
+    on_topic = [
+        SearchHit(title="SQLite write-ahead logging", url=f"https://s.test/{i}")
+        for i in range(4)
+    ]
+    checks = {
+        c.engine: c
+        for c in await doctor(
+            engines=(
+                engine("fine", on_topic),
+                engine("decoy", _hits("decoy", *DECOYS), decoys=True),
+                engine("challenged", EngineBlocked("answered HTTP 202", status=202)),
+                engine("limited", WebError("returned HTTP 429.", status=429)),
+                engine("soft", soft_block("soft")),
+                engine("nothing", []),
+                engine("broken", WebError("returned HTTP 502.", status=502)),
+                engine("crashed", KeyError("rows")),
+            )
+        )
+    }
+    assert {name: c.status for name, c in checks.items()} == {
+        "fine": "ok",
+        "decoy": "decoy",
+        "challenged": "blocked",
+        "limited": "blocked",
+        "soft": "empty",
+        "nothing": "empty",
+        "broken": "error",
+        "crashed": "error",
+    }
+    assert checks["fine"].on_topic == 1.0 and checks["fine"].hits == 4
+    assert checks["decoy"].on_topic == 0.0
+
+
+def test_cli_doctor_reports_and_fails_when_an_engine_is_down(monkeypatch, capsys) -> None:
+    async def fake_doctor(query, **kwargs):
+        assert [e.name for e in kwargs["engines"]] == ["bing", "duckduckgo"]
+        return [
+            EngineCheck(engine="bing", status="decoy", seconds=0.5, hits=10,
+                        detail="bing returned off-topic results, likely a decoy block."),
+            EngineCheck(engine="duckduckgo", status="ok", seconds=1.0, hits=10, on_topic=1.0),
+        ]
+
+    monkeypatch.setattr("webless.cli.doctor", fake_doctor)
+    assert main(["doctor", "-e", "bing", "-e", "duckduckgo"]) == 1
+    out = capsys.readouterr().out
+    assert "decoy" in out and "1 of 2 engines working" in out
+
+
+def test_cli_doctor_succeeds_when_every_engine_works(monkeypatch, capsys) -> None:
+    async def fake_doctor(query, **kwargs):
+        return [EngineCheck(engine="duckduckgo", status="ok", seconds=1.0, hits=10)]
+
+    monkeypatch.setattr("webless.cli.doctor", fake_doctor)
+    assert main(["doctor", "--json"]) == 0
+    assert '"status": "ok"' in capsys.readouterr().out

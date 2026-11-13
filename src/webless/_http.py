@@ -19,6 +19,11 @@ Requests are also guarded against pointing back inward. A URL that resolves to
 a private, loopback, or link-local address is refused before it is sent, on
 the original URL and again on every redirect hop, so a caller cannot be
 steered into the machine's own network.
+
+All requests made on one event loop share one `httpx.AsyncClient`, so
+connections to an engine are reused across calls and cookies an engine sets
+are sent back on the next request -- several engines' anti-bot checks treat a
+client that never returns its cookies as a robot. `aclose` releases it.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import asyncio
 import ipaddress
 import random
 import socket
+import weakref
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
@@ -60,6 +66,10 @@ DEFAULT_TIMEOUT_S = 15.0
 MAX_REDIRECTS = 5
 MAX_ATTEMPTS = 3
 MAX_BODY_BYTES = 5 * 1024 * 1024
+
+_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 class WebError(Exception):
@@ -160,6 +170,35 @@ async def _guard_host(url: str) -> None:
         )
 
 
+def _shared_client() -> httpx.AsyncClient:
+    """The client for the running event loop, created on first use.
+
+    A client's connections belong to the loop that opened them, so one is
+    kept per loop rather than per process: the sync wrappers run a fresh loop
+    for every call, and a client carried over from a finished loop would hand
+    out dead connections. Entries are weak, so a loop that is gone takes its
+    client with it.
+    """
+    loop = asyncio.get_running_loop()
+    client = _CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(follow_redirects=False, http2=False)
+        _CLIENTS[loop] = client
+    return client
+
+
+async def aclose() -> None:
+    """Close the running loop's shared client and forget its cookies.
+
+    Optional: a client left open is released when its loop goes away. Call it
+    before closing a long-lived loop of your own to free the connections
+    promptly; the next request simply opens a new client.
+    """
+    client = _CLIENTS.pop(asyncio.get_running_loop(), None)
+    if client is not None:
+        await client.aclose()
+
+
 @dataclass(slots=True)
 class Response:
     """A completed fetch."""
@@ -231,46 +270,46 @@ async def _fetch_once(
 ) -> Response:
     """Perform one request, following and re-guarding redirects by hand."""
     current = url
-    async with httpx.AsyncClient(
-        follow_redirects=False,
-        timeout=httpx.Timeout(timeout),
-        http2=False,
-    ) as client:
-        for _ in range(MAX_REDIRECTS + 1):
-            await _guard_host(current)
-            try:
-                response = await client.get(current, headers=headers)
-            except httpx.TimeoutException as exc:
-                raise WebError(f"{current} timed out after {timeout:g}s.") from exc
-
-            if response.is_redirect:
-                location = response.headers.get("location", "")
-                if not location:
-                    raise WebError(f"{current} redirected without a target.")
-                current = normalize_url(str(response.url.join(location)))
-                continue
-
-            if response.status_code >= 400:
-                raise WebError(
-                    f"{current} returned HTTP {response.status_code}.",
-                    status=response.status_code,
-                )
-
-            body = response.content[:MAX_BODY_BYTES]
-            return Response(
-                url=url,
-                final_url=str(response.url),
-                status=response.status_code,
-                text=body.decode(response.encoding or "utf-8", errors="replace"),
-                content_type=response.headers.get("content-type", "").lower(),
-                headers=dict(response.headers),
+    client = _shared_client()
+    for _ in range(MAX_REDIRECTS + 1):
+        await _guard_host(current)
+        try:
+            response = await client.get(
+                current, headers=headers, timeout=httpx.Timeout(timeout)
             )
+        except httpx.TimeoutException as exc:
+            raise WebError(f"{current} timed out after {timeout:g}s.") from exc
+
+        if response.is_redirect:
+            location = response.headers.get("location", "")
+            if not location:
+                raise WebError(f"{current} redirected without a target.")
+            current = normalize_url(str(response.url.join(location)))
+            continue
+
+        if response.status_code >= 400:
+            raise WebError(
+                f"{current} returned HTTP {response.status_code}.",
+                status=response.status_code,
+            )
+
+        body = response.content[:MAX_BODY_BYTES]
+        return Response(
+            url=url,
+            final_url=str(response.url),
+            status=response.status_code,
+            text=body.decode(response.encoding or "utf-8", errors="replace"),
+            content_type=response.headers.get("content-type", "").lower(),
+            headers=dict(response.headers),
+        )
 
     raise WebError(f"{url} exceeded {MAX_REDIRECTS} redirects.")
 
 
 __all__ = [
     "USER_AGENTS",
+    "BLOCKED_STATUSES",
+    "aclose",
     "Response",
     "WebError",
     "fetch_url",

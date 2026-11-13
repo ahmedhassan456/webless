@@ -51,3 +51,5 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = ["live: queries the real search engines over the network; run with `pytest -m live`"]
+addopts = "-m 'not live'"

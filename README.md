@@ -88,6 +88,22 @@ A soft block is detected rather than mistaken for an empty index. A results
 page that returns HTTP 200 and parses to zero rows, or answers with a
 challenge status, is reported as that engine failing.
 
+So is a **decoy block**: an engine that has flagged a client may answer with a
+full page of real-looking results that ignore the query (Bing, asked for
+"reciprocal rank fusion", has been seen serving Outlook login pages). When
+fewer than a fifth of a scraped engine's results mention at least half the
+query's words, the page is reported as `"... returned off-topic results,
+likely a decoy block."` rather than counted as an answer. Search APIs
+(Wikipedia, Marginalia, Hacker News) are not judged this way: their loose
+matches are genuine, just weak, and ranking already demotes them.
+
+**A blocked engine is paused.** An engine that was just blocked is likely to
+stay blocked, so it is skipped for five minutes rather than costing a request
+on every call; other failures pause it after three in a row, and one success
+clears the record. Skipped engines appear in `failed` with the reason. If
+every engine is paused, all of them are tried anyway. The state is per
+process, in `webless.ENGINE_HEALTH`; `ENGINE_HEALTH.reset()` forgets it.
+
 ## `fetch`
 
 ```python
@@ -129,6 +145,45 @@ page.status, page.content_type, page.host, page.truncated
 Already holding a response from your own client or a cache? `render(response,
 format=..., full_page=...)` does the same conversion with no network call.
 
+## Checking the engines
+
+Public endpoints change their markup and block clients without notice, and
+which ones answer depends on the network you are on. `webless doctor` asks
+each engine a probe query and reports what came back:
+
+```text
+$ webless doctor
+probe: 'sqlite write-ahead logging'
+
+engine       status   hits on-topic   time
+duckduckgo   ok         10     100%   0.8s
+mojeek       empty       0       0%   0.3s
+             mojeek returned a page with no results, likely a soft block.
+bing         decoy      10       0%   0.3s
+             bing returned off-topic results, likely a decoy block.
+wikipedia    ok          7      57%   0.4s
+...
+```
+
+The status is `ok`, `blocked` (challenge, 401, 403, or 429), `decoy`,
+`empty` (soft block or changed markup), `timeout`, or `error`. It exits
+non-zero unless every engine is working; `--engine NAME` checks just one,
+`--json` prints machine-readable output, and `doctor()` / `check_engine()`
+do the same from Python. It bypasses the pause above and does not record
+into it.
+
+The test suite runs offline against saved pages. The live tests ask the real
+engines and run only on request:
+
+```bash
+uv run pytest -m live -rs
+```
+
+An engine refusing your network outright is skipped with the reason; an empty
+page or decoy results fail, since from outside they cannot be told apart from
+a parser that no longer matches. `.github/workflows/live.yml` runs them
+weekly.
+
 ## Not blocking
 
 Two senses, both deliberate.
@@ -141,6 +196,12 @@ and nothing more.
 retry after a 403 or 429 presents a *different* browser user agent rather than
 repeating the one just refused — which clears most transient blocks on its
 own. Retries back off exponentially with jitter.
+
+Requests on one event loop share a single HTTP client, so connections are
+reused and cookies an engine sets are sent back, as a browser would; some
+anti-bot checks flag a client that never returns them. `await
+webless.aclose()` releases it early; otherwise it goes with its loop, and the
+`*_sync` wrappers close theirs after each call.
 
 ## Not reachable inward
 

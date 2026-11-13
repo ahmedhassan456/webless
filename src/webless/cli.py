@@ -14,6 +14,8 @@ import sys
 from dataclasses import asdict
 
 from . import __version__
+from ._doctor import PROBE_QUERY, doctor
+from ._engines import ENGINES_BY_NAME, WIDE_ENGINES
 from ._http import WebError
 from ._fetch import fetch
 from ._search import DEFAULT_LIMIT, search
@@ -45,6 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--offset", type=int, default=0)
     get.add_argument("--timeout", type=float, default=None)
     get.add_argument("--json", action="store_true")
+
+    check = sub.add_parser("doctor", help="check which search engines are working")
+    check.add_argument("-q", "--query", default=PROBE_QUERY, help="the probe query")
+    check.add_argument(
+        "-e", "--engine", action="append", choices=sorted(ENGINES_BY_NAME),
+        metavar="NAME", default=None, help="check only this engine (repeatable)",
+    )
+    check.add_argument("--timeout", type=float, default=12.0)
+    check.add_argument("--json", action="store_true")
     return parser
 
 
@@ -104,10 +115,39 @@ async def run_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+async def run_doctor(args: argparse.Namespace) -> int:
+    """Print each engine's status. Exits 1 unless every engine is working."""
+    engines = (
+        tuple(ENGINES_BY_NAME[name] for name in dict.fromkeys(args.engine))
+        if args.engine
+        else WIDE_ENGINES
+    )
+    checks = await doctor(args.query, engines=engines, timeout=args.timeout)
+
+    if args.json:
+        print(json.dumps([asdict(c) for c in checks], indent=2))
+    else:
+        print(f"probe: {args.query!r}\n")
+        print(f"{'engine':<12} {'status':<8} {'hits':>4} {'on-topic':>8} {'time':>6}")
+        for c in checks:
+            print(
+                f"{c.engine:<12} {c.status:<8} {c.hits:>4} "
+                f"{c.on_topic:>8.0%} {c.seconds:>5.1f}s"
+            )
+            if c.detail:
+                print(f"{'':<12} {c.detail}")
+        working = sum(c.ok for c in checks)
+        print(f"\n{working} of {len(checks)} engines working")
+    return 0 if all(c.ok for c in checks) else 1
+
+
+RUNNERS = {"search": run_search, "fetch": run_fetch, "doctor": run_doctor}
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Network failures print a message rather than a traceback."""
     args = build_parser().parse_args(argv)
-    runner = run_search if args.command == "search" else run_fetch
+    runner = RUNNERS[args.command]
     try:
         return asyncio.run(runner(args))
     except (WebError, ValueError) as exc:

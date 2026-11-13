@@ -12,7 +12,16 @@ import asyncio
 from typing import Any
 
 from ._fetch import Page, fetch
+from ._http import aclose
 from ._search import SearchResult, search
+
+
+async def _then_close(coro: Any) -> Any:
+    """Await `coro`, then close the shared client its loop opened."""
+    try:
+        return await coro
+    finally:
+        await aclose()
 
 
 def _run(coro: Any) -> Any:
@@ -25,7 +34,7 @@ def _run(coro: Any) -> Any:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
+        return asyncio.run(_then_close(coro))
     coro.close()
     raise RuntimeError(
         "a sync call cannot run inside an event loop; await the async version instead"
