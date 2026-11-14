@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from webless import ENGINE_HEALTH
+from webless._engines import _NEXT_SLOT, SEARXNG_ENV
 
 
 @pytest.fixture(autouse=True)
@@ -17,3 +18,17 @@ def fresh_engine_health():
     ENGINE_HEALTH.reset()
     yield
     ENGINE_HEALTH.reset()
+
+
+@pytest.fixture(autouse=True)
+def no_ambient_configuration(monkeypatch):
+    """Keep the developer's environment and earlier tests out of each test.
+
+    A SearXNG server set in the shell would add an engine to every search,
+    and request spacing is process-wide, so a test that queried arXiv would
+    make the next one wait three seconds.
+    """
+    monkeypatch.delenv(SEARXNG_ENV, raising=False)
+    _NEXT_SLOT.clear()
+    yield
+    _NEXT_SLOT.clear()

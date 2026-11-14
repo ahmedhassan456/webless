@@ -41,6 +41,8 @@ result = await search(
     "sqlite write-ahead logging",
     limit=10,
     wide=False,
+    topic=None,               # "code", "science", or "news"
+    searxng_url=None,         # a SearXNG server you run
     allowed_domains=["sqlite.org"],
     blocked_domains=["pinterest.com"],
     timeout=12.0,
@@ -62,6 +64,50 @@ an engine answering loosely cannot outrank one answering the question.
 
 `allowed_domains` and `blocked_domains` filter on host, and an entry covers
 its subdomains: `python.org` keeps `docs.python.org`.
+
+### Topics
+
+A general engine buries the answer to a specialist question under SEO pages,
+and the specialist indexes have stable public APIs. `topic=` **adds** their
+engines to the general set, so their results are fused in rather than
+replacing the web:
+
+| topic | adds | good for |
+|---|---|---|
+| `code` | Stack Overflow (Stack Exchange API) | errors, how-tos; snippet shows votes, answers, and tags |
+| `science` | OpenAlex, arXiv, PubMed | papers; snippet shows year, venue, citations, abstract |
+| `news` | Bing News (RSS) | recent reporting, linked straight to the publisher |
+
+```python
+await search("python asyncio taskgroup cancel", topic="code")
+await search("crispr off-target effects", topic="science")
+```
+
+OpenAlex results link to a paper's open-access copy where one exists, since
+publishers' DOI pages often refuse automated requests. arXiv asks for one
+request every three seconds, and NCBI for at most three a second without a
+key; both are enforced per process, so concurrent searches queue rather than
+get refused. Stack Exchange allows about 300 keyless requests a day per IP;
+past that it is reported as blocked and paused like any other engine.
+
+### SearXNG
+
+[SearXNG](https://docs.searxng.org/) is a self-hosted metasearch engine: one
+request fans out to Google, Brave, and whatever else the server has enabled,
+which no keyless public endpoint reaches from most networks. If you run one,
+webless can use it as another engine:
+
+```bash
+docker run -d -p 8888:8080 searxng/searxng
+export WEBLESS_SEARXNG_URL=http://localhost:8888
+```
+
+or `search(..., searxng_url="http://localhost:8888")`. The server must allow
+JSON output — add `json` to `search: formats:` in its `settings.yml`, or it
+answers 403 (webless says so). Because the server is usually on localhost,
+that one request is exempt from the private-address guard below; the URLs it
+returns are guarded like any other. Passing `engines=` explicitly leaves the
+environment variable out, and `searxng_url=""` always does.
 
 ### Results
 
@@ -132,6 +178,12 @@ and follow links out of. Relative links are absolutised against the final URL.
 
 JSON responses are returned pretty-printed.
 
+**Stack Exchange questions are read through the API.** Stack Overflow answers
+HTTP 403 to automated page requests, so a question URL on any Stack Exchange
+site is fetched from the public API instead and rendered as the question
+followed by up to five answers, accepted first, then by score. If the API is
+unavailable the page itself is tried; `format="raw"` always fetches the page.
+
 ```python
 page.content       # the rendered text
 page.title         # <og:title>, else <title>
@@ -149,26 +201,30 @@ format=..., full_page=...)` does the same conversion with no network call.
 
 Public endpoints change their markup and block clients without notice, and
 which ones answer depends on the network you are on. `webless doctor` asks
-each engine a probe query and reports what came back:
+every engine (and your SearXNG server, if configured) a probe query suited to
+it and reports what came back:
 
 ```text
 $ webless doctor
-probe: 'sqlite write-ahead logging'
-
-engine       status   hits on-topic   time
-duckduckgo   ok         10     100%   0.8s
-mojeek       empty       0       0%   0.3s
-             mojeek returned a page with no results, likely a soft block.
-bing         decoy      10       0%   0.3s
-             bing returned off-topic results, likely a decoy block.
-wikipedia    ok          7      57%   0.4s
+engine         status   hits on-topic   time  query
+duckduckgo     ok         10     100%   0.8s  sqlite write-ahead logging
+mojeek         empty       0       0%   0.4s  sqlite write-ahead logging
+               mojeek returned a page with no results, likely a soft block.
+bing           decoy      10       0%   0.3s  sqlite write-ahead logging
+               bing returned off-topic results, likely a decoy block.
+wikipedia      ok          7      57%   0.5s  sqlite write-ahead logging
 ...
+stackexchange  ok          2     100%   0.4s  python asyncio taskgroup cancel
+openalex       ok         10     100%   0.8s  crispr off-target effects
+pubmed         ok         10      70%   0.9s  crispr off-target effects
+bingnews       ok         10     100%   0.4s  federal reserve interest rates
 ```
 
 The status is `ok`, `blocked` (challenge, 401, 403, or 429), `decoy`,
 `empty` (soft block or changed markup), `timeout`, or `error`. It exits
 non-zero unless every engine is working; `--engine NAME` checks just one,
-`--json` prints machine-readable output, and `doctor()` / `check_engine()`
+`--query` asks every engine the same thing, `--json` prints machine-readable
+output, and `doctor()` / `check_engine()`
 do the same from Python. It bypasses the pause above and does not record
 into it.
 
@@ -222,6 +278,8 @@ Response bodies are capped, and redirect chains are limited to five hops.
 ```bash
 webless search "structured concurrency python" -n 5
 webless search "rust async traits" --wide --allow rust-lang.org
+webless search "rust borrow checker E0502" --topic code
+webless search "dark matter rotation curves" -t science --searxng http://localhost:8888
 webless fetch https://peps.python.org/pep-3156/ > pep.md
 webless fetch https://api.github.com/repos/python/cpython --json | jq .status
 ```
@@ -236,9 +294,15 @@ webless fetch https://api.github.com/repos/python/cpython --json | jq .status
 | DuckDuckGo | scrape | lite view, falls back to the html view |
 | Mojeek | scrape | independent index |
 | Bing | RSS, then scrape | tracker URLs decoded |
-| Wikipedia | OpenSearch API | |
+| Wikipedia | full-text search API | |
 | Marginalia | public API | `wide` only; small-web index |
 | Hacker News | Algolia API | `wide` only; discussion |
+| Stack Overflow | Stack Exchange API | `topic="code"`; ~300 requests/day/IP |
+| OpenAlex | public API | `topic="science"`; all fields |
+| arXiv | Atom API | `topic="science"`; one request per 3 s |
+| PubMed | NCBI E-utilities | `topic="science"`; biomedical |
+| Bing News | RSS | `topic="news"`; tracker URLs decoded |
+| SearXNG | your server's JSON API | when `searxng_url` or `WEBLESS_SEARXNG_URL` is set |
 
 Pick your own set with `engines=`:
 
@@ -249,7 +313,9 @@ result = await search("query", engines=(DuckDuckGoEngine, MojeekEngine))
 ```
 
 A custom engine is any subclass of `Engine` with a `name` and an
-`async search(query, limit, timeout) -> list[SearchHit]`.
+`async search(query, limit, timeout) -> list[SearchHit]`. Optionally set
+`probe` (the query `doctor` checks it with), `min_interval` (seconds between
+its requests), and `serves_decoys` (judge its results for decoy blocks).
 
 ## Honest caveats
 
@@ -263,6 +329,9 @@ worth knowing before you build on them:
   response carries the right query in its metadata and the wrong results in
   its body. The relevance reweighting demotes them, but on a query where Bing
   is the only engine answering you may see them.
+- **arXiv is slow at times.** The same query can take 0.2 s or 15 s, and it
+  answers 429 when busy. On a search it costs only its own result; under
+  `doctor` it may show as `blocked` or `timeout` on a bad minute.
 - **Scrapers track markup.** When an engine changes its results page, its
   parser needs updating; the soft-block detection turns that into a reported
   failure rather than silence.

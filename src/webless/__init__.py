@@ -22,15 +22,24 @@ Example:
 The same two calls exist as `search_sync` and `fetch_sync` for code with no
 event loop, and as a `webless` command on the terminal. `webless doctor` (or
 `doctor()`) checks which engines are answering from where you are.
+
+`search(query, topic="code" | "science" | "news")` adds specialist engines
+-- Stack Overflow; OpenAlex, arXiv, and PubMed; Bing News -- to the general
+ones, and `search(query, searxng_url=...)` adds a SearXNG server you run.
 """
 
 from ._doctor import EngineCheck, check_engine, doctor
 from ._engines import (
+    ALL_ENGINES,
     ENGINE_HEALTH,
     ENGINES_BY_NAME,
     GENERAL_ENGINES,
+    TOPIC_ENGINES,
+    TOPICS,
     WIDE_ENGINES,
+    ArxivEngine,
     BingEngine,
+    BingNewsEngine,
     DuckDuckGoEngine,
     Engine,
     EngineBlocked,
@@ -38,12 +47,18 @@ from ._engines import (
     HackerNewsEngine,
     MarginaliaEngine,
     MojeekEngine,
+    OpenAlexEngine,
+    PubMedEngine,
+    SearXNGEngine,
+    StackExchangeEngine,
     WikipediaEngine,
     alignment,
+    engines_for,
     fuse,
     looks_like_decoy,
     query_terms,
     rank_by_relevance,
+    searxng,
 )
 from ._html import html_to_markdown, main_content, page_description, page_title, parse_html
 from ._http import USER_AGENTS, Response, WebError, aclose, fetch_url, host_of, normalize_url
@@ -77,9 +92,20 @@ __all__ = [
     "WikipediaEngine",
     "MarginaliaEngine",
     "HackerNewsEngine",
+    "StackExchangeEngine",
+    "OpenAlexEngine",
+    "ArxivEngine",
+    "PubMedEngine",
+    "BingNewsEngine",
+    "SearXNGEngine",
+    "searxng",
     "GENERAL_ENGINES",
     "WIDE_ENGINES",
+    "TOPIC_ENGINES",
+    "TOPICS",
+    "ALL_ENGINES",
     "ENGINES_BY_NAME",
+    "engines_for",
     "fuse",
     "rank_by_relevance",
     "query_terms",

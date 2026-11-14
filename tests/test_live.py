@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from webless import WIDE_ENGINES, aclose, alignment, check_engine, fetch, query_terms, search
+from webless import ALL_ENGINES, aclose, alignment, check_engine, fetch, query_terms, search
 from webless._doctor import PROBE_QUERY
 
 pytestmark = pytest.mark.live
@@ -29,7 +29,7 @@ async def close_shared_client():
     await aclose()
 
 
-@pytest.mark.parametrize("engine", WIDE_ENGINES, ids=lambda cls: cls.name)
+@pytest.mark.parametrize("engine", ALL_ENGINES, ids=lambda cls: cls.name)
 async def test_engine_answers_the_probe_query(engine) -> None:
     check = await check_engine(engine)
     if check.status in ("blocked", "timeout"):
@@ -52,3 +52,10 @@ async def test_fetch_renders_a_real_page() -> None:
     assert page.status == 200
     assert "Write-Ahead Log" in page.title
     assert "WAL" in page.content
+
+
+async def test_fetch_reads_a_stack_overflow_question() -> None:
+    # The page itself answers 403; this goes through the API.
+    page = await fetch("https://stackoverflow.com/questions/231767")
+    assert "yield" in page.title.lower()
+    assert "Accepted answer" in page.content or "Answer (score" in page.content

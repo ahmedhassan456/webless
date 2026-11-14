@@ -6,31 +6,38 @@ this client. Both only show up against the real endpoint. `doctor` queries
 each engine directly -- bypassing the cooldown `search` applies, and leaving
 its record untouched -- and reports what came back and whether it was about
 the query.
+
+Each engine is asked its own `probe` query, one it should always have an
+answer for: a general web engine and a medical literature index do not share
+a question both can be judged on.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
 
 from ._engines import (
+    ALL_ENGINES,
+    DEFAULT_PROBE,
     ON_TOPIC_ALIGNMENT,
-    WIDE_ENGINES,
+    SEARXNG_ENV,
     Engine,
     alignment,
     decoy_block,
     is_block,
     looks_like_decoy,
     query_terms,
+    searxng,
 )
 from ._http import WebError
 
-# Chosen so every engine has a real answer: a technical subject with pages on
-# the major indexes, a Wikipedia article, small-web documentation, and Hacker
-# News threads. It also reads as two subjects, so a decoy keyed on the first
-# word ("sqlite") does not pass for an answer.
-PROBE_QUERY = "sqlite write-ahead logging"
+# The general engines' probe: a technical subject with pages on the major
+# indexes, a Wikipedia article, small-web documentation, and Hacker News
+# threads. Topic engines each name their own (`Engine.probe`).
+PROBE_QUERY = DEFAULT_PROBE
 
 STATUSES = ("ok", "blocked", "decoy", "empty", "timeout", "error")
 
@@ -53,6 +60,7 @@ class EngineCheck:
     engine: str
     status: str
     seconds: float
+    query: str = ""
     hits: int = 0
     on_topic: float = 0.0
     detail: str = ""
@@ -65,10 +73,12 @@ class EngineCheck:
 
 
 async def check_engine(
-    engine: type[Engine], query: str = PROBE_QUERY, *, timeout: float = 12.0
+    engine: type[Engine], query: str | None = None, *, timeout: float = 12.0
 ) -> EngineCheck:
-    """Query one engine and classify what came back."""
+    """Query one engine -- with its own probe unless `query` is given -- and
+    classify what came back."""
     instance = engine()
+    query = query or instance.probe
     started = time.monotonic()
 
     def done(status: str, **fields) -> EngineCheck:
@@ -76,13 +86,15 @@ async def check_engine(
             engine=instance.name,
             status=status,
             seconds=round(time.monotonic() - started, 2),
+            query=query,
             **fields,
         )
 
+    # An engine that spaces its requests may wait for a slot; that wait is
+    # not the engine being slow.
+    budget = timeout + 2 + instance.min_interval
     try:
-        hits = await asyncio.wait_for(
-            instance.search(query, 10, timeout), timeout=timeout + 2
-        )
+        hits = await asyncio.wait_for(instance.search(query, 10, timeout), timeout=budget)
     except asyncio.TimeoutError:
         return done("timeout", detail=f"timed out after {timeout:g}s")
     except WebError as exc:
@@ -113,16 +125,35 @@ async def check_engine(
     return done("ok", **fields)
 
 
+def default_engines(searxng_url: str | None = None) -> tuple[type[Engine], ...]:
+    """Every built-in engine, plus SearXNG when a server is named or configured."""
+    server = searxng_url or os.environ.get(SEARXNG_ENV, "")
+    return ALL_ENGINES + ((searxng(server),) if server else ())
+
+
 async def doctor(
-    query: str = PROBE_QUERY,
+    query: str | None = None,
     *,
-    engines: tuple[type[Engine], ...] = WIDE_ENGINES,
+    engines: tuple[type[Engine], ...] | None = None,
     timeout: float = 12.0,
 ) -> list[EngineCheck]:
-    """Check every engine concurrently, in the order given."""
+    """Check every engine concurrently, in the order given.
+
+    Each engine is asked its own probe query unless `query` is given. The
+    default set is every built-in engine, plus SearXNG if
+    ``WEBLESS_SEARXNG_URL`` is set.
+    """
+    chosen = default_engines() if engines is None else engines
     return list(
-        await asyncio.gather(*(check_engine(e, query, timeout=timeout) for e in engines))
+        await asyncio.gather(*(check_engine(e, query, timeout=timeout) for e in chosen))
     )
 
 
-__all__ = ["doctor", "check_engine", "EngineCheck", "PROBE_QUERY", "STATUSES"]
+__all__ = [
+    "doctor",
+    "check_engine",
+    "default_engines",
+    "EngineCheck",
+    "PROBE_QUERY",
+    "STATUSES",
+]

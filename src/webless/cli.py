@@ -14,8 +14,8 @@ import sys
 from dataclasses import asdict
 
 from . import __version__
-from ._doctor import PROBE_QUERY, doctor
-from ._engines import ENGINES_BY_NAME, WIDE_ENGINES
+from ._doctor import default_engines, doctor
+from ._engines import ENGINES_BY_NAME, TOPICS, searxng
 from ._http import WebError
 from ._fetch import fetch
 from ._search import DEFAULT_LIMIT, search
@@ -34,6 +34,15 @@ def build_parser() -> argparse.ArgumentParser:
     find.add_argument("query", nargs="+", help="what to search for")
     find.add_argument("-n", "--limit", type=int, default=DEFAULT_LIMIT)
     find.add_argument("-w", "--wide", action="store_true", help="add the long-tail engines")
+    find.add_argument(
+        "-t", "--topic", choices=TOPICS, default=None,
+        help="add specialist engines: code (Stack Overflow), science (OpenAlex, "
+        "arXiv, PubMed), or news (Bing News)",
+    )
+    find.add_argument(
+        "--searxng", metavar="URL", default=None,
+        help="also query this SearXNG server (default: $WEBLESS_SEARXNG_URL)",
+    )
     find.add_argument("--allow", action="append", metavar="DOMAIN", default=None)
     find.add_argument("--block", action="append", metavar="DOMAIN", default=None)
     find.add_argument("--timeout", type=float, default=12.0)
@@ -49,10 +58,17 @@ def build_parser() -> argparse.ArgumentParser:
     get.add_argument("--json", action="store_true")
 
     check = sub.add_parser("doctor", help="check which search engines are working")
-    check.add_argument("-q", "--query", default=PROBE_QUERY, help="the probe query")
+    check.add_argument(
+        "-q", "--query", default=None,
+        help="ask every engine this instead of its own probe query",
+    )
     check.add_argument(
         "-e", "--engine", action="append", choices=sorted(ENGINES_BY_NAME),
         metavar="NAME", default=None, help="check only this engine (repeatable)",
+    )
+    check.add_argument(
+        "--searxng", metavar="URL", default=None,
+        help="also check this SearXNG server (default: $WEBLESS_SEARXNG_URL)",
     )
     check.add_argument("--timeout", type=float, default=12.0)
     check.add_argument("--json", action="store_true")
@@ -65,6 +81,8 @@ async def run_search(args: argparse.Namespace) -> int:
         " ".join(args.query),
         limit=args.limit,
         wide=args.wide,
+        topic=args.topic,
+        searxng_url=args.searxng,
         timeout=args.timeout,
         allowed_domains=args.allow,
         blocked_domains=args.block,
@@ -117,25 +135,27 @@ async def run_fetch(args: argparse.Namespace) -> int:
 
 async def run_doctor(args: argparse.Namespace) -> int:
     """Print each engine's status. Exits 1 unless every engine is working."""
-    engines = (
-        tuple(ENGINES_BY_NAME[name] for name in dict.fromkeys(args.engine))
-        if args.engine
-        else WIDE_ENGINES
-    )
+    if args.engine:
+        engines = tuple(ENGINES_BY_NAME[name] for name in dict.fromkeys(args.engine))
+        if args.searxng:
+            engines += (searxng(args.searxng),)
+    else:
+        engines = default_engines(args.searxng)
     checks = await doctor(args.query, engines=engines, timeout=args.timeout)
 
     if args.json:
         print(json.dumps([asdict(c) for c in checks], indent=2))
     else:
-        print(f"probe: {args.query!r}\n")
-        print(f"{'engine':<12} {'status':<8} {'hits':>4} {'on-topic':>8} {'time':>6}")
+        print(
+            f"{'engine':<14} {'status':<8} {'hits':>4} {'on-topic':>8} {'time':>6}  query"
+        )
         for c in checks:
             print(
-                f"{c.engine:<12} {c.status:<8} {c.hits:>4} "
-                f"{c.on_topic:>8.0%} {c.seconds:>5.1f}s"
+                f"{c.engine:<14} {c.status:<8} {c.hits:>4} "
+                f"{c.on_topic:>8.0%} {c.seconds:>5.1f}s  {c.query}"
             )
             if c.detail:
-                print(f"{'':<12} {c.detail}")
+                print(f"{'':<14} {c.detail}")
         working = sum(c.ok for c in checks)
         print(f"\n{working} of {len(checks)} engines working")
     return 0 if all(c.ok for c in checks) else 1
