@@ -5,13 +5,16 @@ single fused ranking. The engines are public endpoints, so nothing has to be
 configured before the first call works, and none of them is treated as
 required: an engine that is blocked, rate limited, or slow costs recall and is
 named in `SearchResult.failed`, while the rest of the ranking stands.
+
+A `topic` adds specialist engines to the general ones: Stack Overflow for
+code, OpenAlex, arXiv, and PubMed for science, Bing News for news.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ._engines import GENERAL_ENGINES, WIDE_ENGINES, Engine, SearchHit, search_web
+from ._engines import TOPICS, Engine, SearchHit, engines_for, search_web
 
 DEFAULT_LIMIT = 10
 DEFAULT_TIMEOUT_S = 12.0
@@ -52,7 +55,9 @@ async def search(
     *,
     limit: int = DEFAULT_LIMIT,
     wide: bool = False,
+    topic: str | None = None,
     engines: tuple[type[Engine], ...] | None = None,
+    searxng_url: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     allowed_domains: list[str] | None = None,
     blocked_domains: list[str] | None = None,
@@ -64,13 +69,22 @@ async def search(
     oriented queries and adds latency on ordinary ones. Pass `engines`
     directly to choose the set yourself.
 
+    `topic` adds the engines for one subject on top of that set: ``code``
+    (Stack Overflow), ``science`` (OpenAlex, arXiv, PubMed), or ``news``
+    (Bing News). Their results are fused with the general ones, so a topic
+    reorders the answer toward specialist sources without losing the web.
+
+    `searxng_url` adds a SearXNG server you run. Without it, the
+    ``WEBLESS_SEARXNG_URL`` environment variable is used, unless `engines`
+    was passed; ``searxng_url=""`` leaves SearXNG out.
+
     `allowed_domains` and `blocked_domains` filter on host, and an entry
     covers its subdomains, so ``python.org`` keeps ``docs.python.org``.
     """
     if not query.strip():
         raise ValueError("query is empty")
 
-    chosen = engines if engines is not None else (WIDE_ENGINES if wide else GENERAL_ENGINES)
+    chosen = engines_for(topic, wide=wide, engines=engines, searxng_url=searxng_url)
     report = await search_web(
         query,
         limit=limit,
@@ -87,4 +101,4 @@ async def search(
     )
 
 
-__all__ = ["search", "SearchResult", "SearchHit"]
+__all__ = ["search", "SearchResult", "SearchHit", "TOPICS"]

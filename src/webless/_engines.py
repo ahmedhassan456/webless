@@ -1,9 +1,12 @@
 """The keyless search back ends and the fusion that merges them.
 
-Each engine here is a public endpoint that answers without credentials: three
-scrape a normal results page, three read a public JSON API. None of them is
-trusted to be up. `search_web` queries them concurrently, keeps whatever
-answers inside the deadline, and fuses the surviving rankings, so an engine
+Each engine here is a public endpoint that answers without credentials. The
+general set searches the whole web; the topic sets (`TOPIC_ENGINES`) add
+specialist indexes -- Stack Overflow for code, OpenAlex, arXiv, and PubMed
+for science, Bing News for news -- whose stable APIs answer the questions a
+general engine buries. A SearXNG server the user runs can be added to any
+set. None of them is trusted to be up. `search_web` queries them
+concurrently, keeps whatever answers inside the deadline, and fuses the surviving rankings, so an engine
 that is blocked, rate limited, or simply slow costs recall rather than the
 whole call.
 
@@ -27,6 +30,7 @@ import asyncio
 import base64
 import json
 import html
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -44,6 +48,13 @@ from ._http import (
 )
 
 RRF_K = 60
+
+# The query `doctor` asks an engine that does not name its own. Chosen so the
+# general engines all have a real answer, and so a decoy keyed on the first
+# word ("sqlite") does not pass for one.
+DEFAULT_PROBE = "sqlite write-ahead logging"
+
+SEARXNG_ENV = "WEBLESS_SEARXNG_URL"
 
 # A hit is on topic when it mentions at least half the query's content words,
 # and a scraped engine is serving decoys when fewer than a fifth of its hits
@@ -166,12 +177,24 @@ class Engine:
     # answers to the query -- just weak ones, which ranking already demotes.
     serves_decoys: bool = False
 
+    # The query `doctor` checks this engine with: one it should always answer.
+    probe: str = DEFAULT_PROBE
+
+    # The least time between two requests to this engine, for APIs that ask
+    # for spacing (arXiv: one request every three seconds).
+    min_interval: float = 0.0
+
     async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
         """Return this engine's ranked results for `query`."""
         raise NotImplementedError
 
     async def _get(
-        self, url: str, timeout: float, headers: dict[str, str] | None = None
+        self,
+        url: str,
+        timeout: float,
+        headers: dict[str, str] | None = None,
+        *,
+        allow_private: bool = False,
     ) -> Response:
         """Fetch a results page, refusing anything but a plain 200.
 
@@ -180,7 +203,10 @@ class Engine:
         results, so accepting it would report the engine as working and
         finding nothing.
         """
-        response = await fetch_url(url, timeout=timeout, headers=headers)
+        await self._wait_for_slot()
+        response = await fetch_url(
+            url, timeout=timeout, headers=headers, allow_private=allow_private
+        )
         if response.status != 200:
             raise EngineBlocked(
                 f"{self.name} answered HTTP {response.status}, which is a "
@@ -188,6 +214,32 @@ class Engine:
                 status=response.status,
             )
         return response
+
+    async def _wait_for_slot(self) -> None:
+        """Hold this request until `min_interval` after the previous one.
+
+        Slots are reserved before sleeping, with no await in between, so
+        concurrent searches queue up one interval apart instead of all waking
+        at once. The schedule is per process and per engine name.
+        """
+        if self.min_interval <= 0:
+            return
+        now = time.monotonic()
+        slot = max(now, _NEXT_SLOT.get(self.name, 0.0))
+        _NEXT_SLOT[self.name] = slot + self.min_interval
+        if slot > now:
+            await asyncio.sleep(slot - now)
+
+
+_NEXT_SLOT: dict[str, float] = {}
+
+
+def _json(response: Response) -> object:
+    """The decoded body, or None when it is not JSON."""
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        return None
 
 
 class DuckDuckGoEngine(Engine):
@@ -491,6 +543,368 @@ class HackerNewsEngine(Engine):
         return hits
 
 
+class StackExchangeEngine(Engine):
+    """Stack Overflow, through the Stack Exchange API.
+
+    For a how-to question this is where the answer usually is, and the API
+    returns the questions themselves rather than a page about them, with
+    votes and answer counts to judge them by. It is keyless at about 300
+    requests a day per IP; past that it answers HTTP 400 with a throttle
+    error, which is reported as a block so the engine is paused.
+    """
+
+    name = "stackexchange"
+    probe = "python asyncio taskgroup cancel"
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        url = (
+            "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance"
+            f"&site=stackoverflow&pagesize={min(max(limit, 1), 100)}&q={quote_plus(query)}"
+        )
+        try:
+            response = await self._get(url, timeout, headers={"Accept": "application/json"})
+        except WebError as exc:
+            if exc.status == 400:
+                raise EngineBlocked(
+                    "stackexchange refused the request (HTTP 400), which is how it "
+                    "reports an exhausted daily quota.",
+                    status=400,
+                ) from exc
+            raise
+        body = _json(response)
+        rows = body.get("items") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return []
+        hits: list[SearchHit] = []
+        for row in rows[:limit]:
+            if not isinstance(row, dict):
+                continue
+            answered = "answered" if row.get("is_answered") else "unanswered"
+            tags = ", ".join(str(t) for t in row.get("tags", [])[:5])
+            snippet = (
+                f"Stack Overflow question, {row.get('score', 0)} votes, "
+                f"{row.get('answer_count', 0)} answers ({answered})."
+                + (f" Tags: {tags}." if tags else "")
+            )
+            hit = _hit(
+                html.unescape(str(row.get("title", ""))),
+                str(row.get("link", "")),
+                snippet,
+                self.name,
+            )
+            if hit is not None:
+                hits.append(hit)
+        return hits
+
+
+class OpenAlexEngine(Engine):
+    """OpenAlex, an open index of scholarly works across every field.
+
+    It ranks well -- the paper that coined a term tends to come first -- and
+    carries each work's open-access copy where one exists. That copy is
+    preferred as the result URL: a publisher's DOI landing page often refuses
+    automated requests, and a result `fetch` cannot open is half a result.
+    """
+
+    name = "openalex"
+    probe = "crispr off-target effects"
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        url = (
+            f"https://api.openalex.org/works?search={quote_plus(query)}"
+            f"&per-page={min(max(limit, 1), 50)}"
+            "&select=id,doi,display_name,publication_year,cited_by_count,"
+            "primary_location,best_oa_location,abstract_inverted_index"
+        )
+        response = await self._get(url, timeout, headers={"Accept": "application/json"})
+        body = _json(response)
+        rows = body.get("results") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            return []
+        hits: list[SearchHit] = []
+        for work in rows[:limit]:
+            if not isinstance(work, dict):
+                continue
+            primary = work.get("primary_location") or {}
+            open_copy = work.get("best_oa_location") or {}
+            target = (
+                open_copy.get("landing_page_url")
+                or primary.get("landing_page_url")
+                or work.get("doi")
+                or work.get("id")
+                or ""
+            )
+            venue = (primary.get("source") or {}).get("display_name") or ""
+            details = ", ".join(
+                str(part)
+                for part in (
+                    work.get("publication_year"),
+                    venue,
+                    f"cited by {work.get('cited_by_count', 0)}",
+                )
+                if part
+            )
+            abstract = abstract_text(work.get("abstract_inverted_index"))
+            snippet = f"{details}. {abstract}" if abstract else details
+            hit = _hit(str(work.get("display_name") or ""), str(target), snippet[:400], self.name)
+            if hit is not None:
+                hits.append(hit)
+        return hits
+
+
+def abstract_text(inverted: object, max_words: int = 60) -> str:
+    """Rebuild the start of an abstract from OpenAlex's inverted index.
+
+    OpenAlex ships abstracts as ``{word: [positions]}`` for licensing reasons;
+    laying the words back out by position recovers the text.
+    """
+    if not isinstance(inverted, dict):
+        return ""
+    placed: dict[int, str] = {}
+    for word, positions in inverted.items():
+        if isinstance(positions, list):
+            for position in positions:
+                if isinstance(position, int) and position < max_words:
+                    placed[position] = str(word)
+    words = [placed[i] for i in sorted(placed)]
+    text = " ".join(words)
+    return f"{text} ..." if len(inverted) and len(words) >= max_words else text
+
+
+class ArxivEngine(Engine):
+    """arXiv, for preprints in physics, mathematics, and computer science.
+
+    Its API asks for one request every three seconds, which `min_interval`
+    enforces across every search in the process. Query words are ANDed, since
+    arXiv's default would match a paper mentioning any one of them.
+    """
+
+    name = "arxiv"
+    probe = "crispr off-target effects"
+    min_interval = 3.0
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        terms = query_terms(query) or re.findall(r"[a-z0-9]+", query.lower())
+        if not terms:
+            return []
+        search_query = "+AND+".join(f"all:{quote_plus(term)}" for term in terms)
+        url = (
+            f"https://export.arxiv.org/api/query?search_query={search_query}"
+            f"&sortBy=relevance&max_results={min(max(limit, 1), 50)}"
+        )
+        response = await self._get(url, timeout)
+        root = parse_html(response.text, xml=True)
+        hits: list[SearchHit] = []
+        for entry in root.select("entry")[:limit]:
+            link = entry.select_one("id")
+            title = entry.select_one("title")
+            summary = entry.select_one("summary")
+            published = entry.select_one("published")
+            href = (link.text() if link else "").strip()
+            if href.startswith("http://arxiv.org/"):
+                href = "https://" + href.removeprefix("http://")
+            year = (published.text() if published else "")[:4]
+            snippet = f"arXiv preprint{', ' + year if year else ''}. " + _clean(
+                summary.text() if summary else ""
+            )
+            hit = _hit(title.text() if title else "", href, snippet[:400], self.name)
+            if hit is not None:
+                hits.append(hit)
+        return hits
+
+
+class PubMedEngine(Engine):
+    """PubMed, through NCBI's E-utilities, for biomedical literature.
+
+    Two requests per search -- one for the matching IDs, one for their
+    summaries. NCBI allows three requests a second without a key, which
+    `min_interval` keeps under.
+    """
+
+    name = "pubmed"
+    probe = "crispr off-target effects"
+    min_interval = 0.34
+
+    BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        found = _json(
+            await self._get(
+                f"{self.BASE}/esearch.fcgi?db=pubmed&retmode=json&sort=relevance"
+                f"&tool=webless&retmax={min(max(limit, 1), 100)}&term={quote_plus(query)}",
+                timeout,
+                headers={"Accept": "application/json"},
+            )
+        )
+        result = found.get("esearchresult") if isinstance(found, dict) else None
+        ids = [str(i) for i in (result or {}).get("idlist", []) if str(i).isdigit()]
+        if not ids:
+            return []
+        summaries = _json(
+            await self._get(
+                f"{self.BASE}/esummary.fcgi?db=pubmed&retmode=json&tool=webless"
+                f"&id={','.join(ids[:limit])}",
+                timeout,
+                headers={"Accept": "application/json"},
+            )
+        )
+        records = summaries.get("result") if isinstance(summaries, dict) else None
+        if not isinstance(records, dict):
+            return []
+        hits: list[SearchHit] = []
+        for pmid in ids[:limit]:
+            record = records.get(pmid)
+            if not isinstance(record, dict):
+                continue
+            authors = record.get("authors") or []
+            first = authors[0].get("name", "") if authors and isinstance(authors[0], dict) else ""
+            byline = f"{first} et al." if len(authors) > 1 else first
+            details = ", ".join(
+                part
+                for part in (byline, str(record.get("source", "")), str(record.get("pubdate", "")))
+                if part
+            )
+            hit = _hit(
+                str(record.get("title", "")),
+                f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                f"PubMed: {details}.",
+                self.name,
+            )
+            if hit is not None:
+                hits.append(hit)
+        return hits
+
+
+class BingNewsEngine(Engine):
+    """Bing News, through its RSS view, for recent reporting.
+
+    Each link is a `bing.com/news/apiclick.aspx` tracker carrying the article
+    URL in its `url` parameter, decoded here so results point at the
+    publisher. Scraped from Bing, so it is checked for decoys like Bing's web
+    results are.
+    """
+
+    name = "bingnews"
+    serves_decoys = True
+    probe = "federal reserve interest rates"
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        url = (
+            f"https://www.bing.com/news/search?q={quote_plus(query)}"
+            "&format=rss&mkt=en-US&setlang=en"
+        )
+        response = await self._get(url, timeout)
+        root = parse_html(response.text, xml=True)
+        hits: list[SearchHit] = []
+        for item in root.select("item")[:limit]:
+            title = item.select_one("title")
+            link = item.select_one("link")
+            description = item.select_one("description")
+            published = item.select_one("pubdate")  # tag names are lowercased
+            snippet = " ".join(
+                part
+                for part in (
+                    description.text() if description else "",
+                    f"({published.text()})" if published else "",
+                )
+                if part
+            )
+            hit = _hit(
+                title.text() if title else "",
+                decode_bing_news_url(link.text() if link else ""),
+                snippet,
+                self.name,
+            )
+            if hit is not None:
+                hits.append(hit)
+        if not hits and root.select_one("channel") is None:
+            raise soft_block(self.name)
+        return hits
+
+
+def decode_bing_news_url(href: str) -> str:
+    """The article behind a Bing News `apiclick.aspx` tracker.
+
+    Returns an empty string for a tracker with no usable target, so the item
+    is dropped rather than listed as a link back to Bing.
+    """
+    try:
+        parts = urlsplit(href.strip())
+    except ValueError:
+        return ""
+    if not (parts.hostname or "").endswith("bing.com") or not parts.path.lower().endswith(
+        "/apiclick.aspx"
+    ):
+        return href
+    target = parse_qs(parts.query).get("url", [""])[0]
+    return target if target.lower().startswith(("http://", "https://")) else ""
+
+
+class SearXNGEngine(Engine):
+    """A SearXNG server you run, through its JSON API.
+
+    SearXNG is a self-hosted metasearch engine: one request here fans out to
+    whichever engines the server has enabled, Google and Brave among them,
+    which no keyless public endpoint reaches from most networks. Point
+    `search(searxng_url=...)` or the ``WEBLESS_SEARXNG_URL`` environment
+    variable at it. The server must allow JSON output -- ``formats: [html,
+    json]`` under ``search:`` in its settings.yml -- or it answers 403.
+
+    The server is usually on localhost, so this one request is exempt from the
+    private-address guard. The URLs it returns are guarded like any other
+    when fetched.
+    """
+
+    name = "searxng"
+    base_url: str = ""
+
+    async def search(self, query: str, limit: int, timeout: float) -> list[SearchHit]:
+        base = (self.base_url or os.environ.get(SEARXNG_ENV, "")).strip().rstrip("/")
+        if not base:
+            raise WebError(
+                f"searxng has no server: pass searxng_url or set {SEARXNG_ENV}."
+            )
+        try:
+            response = await self._get(
+                f"{base}/search?q={quote_plus(query)}&format=json",
+                timeout,
+                headers={"Accept": "application/json"},
+                allow_private=True,
+            )
+        except WebError as exc:
+            if exc.status == 403:
+                raise WebError(
+                    f"{base} refused format=json (HTTP 403); enable it with "
+                    "`formats: [html, json]` under `search:` in the server's settings.yml.",
+                    status=403,
+                ) from exc
+            raise
+        body = _json(response)
+        rows = body.get("results") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            raise WebError(f"{base} did not answer with SearXNG JSON results.")
+        hits: list[SearchHit] = []
+        for row in rows:
+            if len(hits) >= limit:
+                break
+            if not isinstance(row, dict):
+                continue
+            hit = _hit(
+                str(row.get("title", "")),
+                str(row.get("url", "")),
+                str(row.get("content", "")),
+                self.name,
+            )
+            if hit is not None:
+                hits.append(hit)
+        return hits
+
+
+def searxng(url: str) -> type[SearXNGEngine]:
+    """An engine class bound to the SearXNG server at `url`."""
+    return type("SearXNGEngine", (SearXNGEngine,), {"base_url": url.strip().rstrip("/")})
+
+
 GENERAL_ENGINES: tuple[type[Engine], ...] = (
     DuckDuckGoEngine,
     MojeekEngine,
@@ -503,9 +917,48 @@ WIDE_ENGINES: tuple[type[Engine], ...] = GENERAL_ENGINES + (
     HackerNewsEngine,
 )
 
-ENGINES_BY_NAME = {
-    cls.name: cls for cls in (*WIDE_ENGINES,)
+TOPIC_ENGINES: dict[str, tuple[type[Engine], ...]] = {
+    "code": (StackExchangeEngine,),
+    "science": (OpenAlexEngine, ArxivEngine, PubMedEngine),
+    "news": (BingNewsEngine,),
 }
+
+TOPICS = tuple(TOPIC_ENGINES)
+
+ALL_ENGINES: tuple[type[Engine], ...] = WIDE_ENGINES + tuple(
+    dict.fromkeys(cls for group in TOPIC_ENGINES.values() for cls in group)
+)
+
+ENGINES_BY_NAME = {cls.name: cls for cls in ALL_ENGINES}
+
+
+def engines_for(
+    topic: str | None = None,
+    *,
+    wide: bool = False,
+    engines: tuple[type[Engine], ...] | None = None,
+    searxng_url: str | None = None,
+) -> tuple[type[Engine], ...]:
+    """The engine set for a search.
+
+    Starts from `engines` if given, else the wide or general set. A `topic`
+    adds its specialists rather than replacing the web: a code question still
+    gets general results, with Stack Overflow's on top. A SearXNG server is
+    added when `searxng_url` names one, or -- unless `engines` was given
+    explicitly -- when ``WEBLESS_SEARXNG_URL`` is set. Pass ``searxng_url=""``
+    to leave it out regardless.
+    """
+    chosen = list(engines if engines is not None else (WIDE_ENGINES if wide else GENERAL_ENGINES))
+    if topic is not None:
+        if topic not in TOPIC_ENGINES:
+            raise ValueError(f"topic must be one of {', '.join(TOPICS)}; got {topic!r}")
+        chosen += [cls for cls in TOPIC_ENGINES[topic] if cls not in chosen]
+    server = searxng_url
+    if server is None and engines is None:
+        server = os.environ.get(SEARXNG_ENV, "")
+    if server and not any(issubclass(cls, SearXNGEngine) for cls in chosen):
+        chosen.append(searxng(server))
+    return tuple(chosen)
 
 
 def fuse(ranked: list[list[SearchHit]], k: int = RRF_K) -> list[SearchHit]:
@@ -777,13 +1230,28 @@ __all__ = [
     "SearchReport",
     "GENERAL_ENGINES",
     "WIDE_ENGINES",
+    "TOPIC_ENGINES",
+    "TOPICS",
+    "ALL_ENGINES",
     "ENGINES_BY_NAME",
+    "engines_for",
+    "searxng",
+    "SEARXNG_ENV",
+    "DEFAULT_PROBE",
     "DuckDuckGoEngine",
     "MojeekEngine",
     "BingEngine",
     "WikipediaEngine",
     "MarginaliaEngine",
     "HackerNewsEngine",
+    "StackExchangeEngine",
+    "OpenAlexEngine",
+    "ArxivEngine",
+    "PubMedEngine",
+    "BingNewsEngine",
+    "SearXNGEngine",
+    "abstract_text",
+    "decode_bing_news_url",
     "search_web",
     "fuse",
     "rank_by_relevance",

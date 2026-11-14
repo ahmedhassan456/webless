@@ -148,14 +148,20 @@ def _is_public_address(address: str) -> bool:
     )
 
 
-async def _guard_host(url: str) -> None:
-    """Refuse a URL that resolves into private or loopback address space."""
+async def _guard_host(url: str, *, allow_private: bool = False) -> None:
+    """Refuse a URL that resolves into private or loopback address space.
+
+    `allow_private` keeps the scheme and host checks but skips the address
+    check, for a server the user configured themselves.
+    """
     parts = urlsplit(url)
     if parts.scheme not in {"http", "https"}:
         raise WebError(f"Unsupported URL scheme: {parts.scheme or 'none'}.")
     host = parts.hostname
     if not host:
         raise WebError(f"{url} has no host.")
+    if allow_private:
+        return
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
             host, parts.port or (443 if parts.scheme == "https" else 80),
@@ -228,6 +234,7 @@ async def fetch_url(
     timeout: float = DEFAULT_TIMEOUT_S,
     attempts: int = MAX_ATTEMPTS,
     abort: asyncio.Event | None = None,
+    allow_private: bool = False,
 ) -> Response:
     """Fetch `url` and return its body, rotating fingerprint on a block.
 
@@ -235,6 +242,10 @@ async def fetch_url(
     private address space. A retryable status or transport error backs off and
     tries again with a fresh user agent, up to `attempts` times; anything else
     is raised as a `WebError` carrying the status.
+
+    `allow_private` lifts the private-address guard. It exists for one case --
+    a search server the user runs themselves, typically on localhost -- and
+    must never be set for a URL that came from a search result or a model.
     """
     target = normalize_url(url)
     user_agent: str | None = None
@@ -252,7 +263,9 @@ async def fetch_url(
             **(headers or {}),
         }
         try:
-            return await _fetch_once(target, request_headers, timeout)
+            return await _fetch_once(
+                target, request_headers, timeout, allow_private=allow_private
+            )
         except WebError as exc:
             last_error = exc
             if exc.status is None or exc.status not in (
@@ -266,13 +279,13 @@ async def fetch_url(
 
 
 async def _fetch_once(
-    url: str, headers: dict[str, str], timeout: float
+    url: str, headers: dict[str, str], timeout: float, *, allow_private: bool = False
 ) -> Response:
     """Perform one request, following and re-guarding redirects by hand."""
     current = url
     client = _shared_client()
     for _ in range(MAX_REDIRECTS + 1):
-        await _guard_host(current)
+        await _guard_host(current, allow_private=allow_private)
         try:
             response = await client.get(
                 current, headers=headers, timeout=httpx.Timeout(timeout)
