@@ -30,6 +30,9 @@ same arguments.
 pip install webless
 ```
 
+For the [MCP server](#mcp-server), install the extra:
+`pip install "webless[mcp]"`.
+
 The only dependency is `httpx`. HTML parsing, content extraction, and Markdown
 rendering are all written against the standard library, so there is no
 `lxml`, no `beautifulsoup4`, and no compiler needed to install.
@@ -285,7 +288,107 @@ webless fetch https://api.github.com/repos/python/cpython --json | jq .status
 ```
 
 `--json` on either subcommand prints the full record, so it composes with
-`jq`. `search` exits non-zero when every engine failed.
+`jq`. `webless mcp` runs the [MCP server](#mcp-server). `search` exits non-zero when every engine failed.
+
+## MCP server
+
+webless runs as a [Model Context Protocol](https://modelcontextprotocol.io)
+server, so any MCP client — Claude Code, Claude Desktop, Cursor, VS Code,
+Zed, or your own agent — can search and read the web through it, with no API
+key to configure.
+
+| tool | does |
+|---|---|
+| `web_search` | fused multi-engine search; `topic` (`code`, `science`, `news`), `limit`, `allowed_domains`, `blocked_domains`, `wide` |
+| `web_fetch` | a page as Markdown or text; long pages are read in sections with `offset`, and the result says where to continue |
+| `search_engine_status` | `webless doctor`: which engines are answering from this network |
+
+All three are marked read-only and open-world, so clients that ask before
+running a tool can treat them accordingly.
+
+### Running it
+
+```bash
+webless-mcp                      # stdio, for clients that launch the server
+webless mcp                      # the same, as a subcommand
+webless mcp --transport http     # Streamable HTTP at http://127.0.0.1:8000/mcp
+webless mcp --transport http --host 0.0.0.0 --port 9000 --path /mcp
+```
+
+Use stdio for a client on the same machine; it starts and stops the server
+itself. Use HTTP to share one server between clients or across a network,
+which keeps the engine pause state (and SearXNG configuration) in one
+place. The HTTP server has no authentication, so it listens on localhost
+unless you pass `--host`; put it behind something that authenticates before
+exposing it.
+
+With [uv](https://docs.astral.sh/uv/), `uvx --from "webless[mcp]" webless-mcp`
+runs the server without installing anything first, which is what the
+configurations below use. To run a local checkout instead, replace the
+command with `uv` and the arguments with `["run", "--directory",
+"/path/to/webless", "webless-mcp"]`.
+
+### Adding it to a client
+
+**Claude Code**
+
+```bash
+claude mcp add webless -- uvx --from "webless[mcp]" webless-mcp
+```
+
+**Claude Desktop** (`claude_desktop_config.json`), **Cursor**
+(`~/.cursor/mcp.json`), and most other clients:
+
+```json
+{
+  "mcpServers": {
+    "webless": {
+      "command": "uvx",
+      "args": ["--from", "webless[mcp]", "webless-mcp"]
+    }
+  }
+}
+```
+
+**VS Code** (`.vscode/mcp.json`):
+
+```json
+{
+  "servers": {
+    "webless": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["--from", "webless[mcp]", "webless-mcp"]
+    }
+  }
+}
+```
+
+**A client that connects to a URL:** start `webless mcp --transport http`
+and point it at `http://127.0.0.1:8000/mcp`.
+
+To add a SearXNG server, set `WEBLESS_SEARXNG_URL` in the server's
+environment — `"env": {"WEBLESS_SEARXNG_URL": "http://localhost:8888"}` in the
+JSON configurations, or `-e WEBLESS_SEARXNG_URL=...` with `claude mcp add`.
+
+### Trying it by hand
+
+```bash
+npx @modelcontextprotocol/inspector uvx --from "webless[mcp]" webless-mcp
+```
+
+opens the MCP Inspector, where you can call each tool and see exactly what a
+client receives.
+
+### Safety
+
+The URLs `web_fetch` opens are chosen by a model, which may be reading pages
+written by anyone. The private-address guard (see [Not reachable
+inward](#not-reachable-inward)) is what stops a page from talking the model
+into reading `localhost`, your LAN, or a cloud metadata endpoint through this
+server, and it applies to every fetch, including each redirect. Results and
+page sections are capped (25 results, 100,000 characters) so a single call
+cannot flood the model's context.
 
 ## Engines
 

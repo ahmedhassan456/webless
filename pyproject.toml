@@ -9,7 +9,7 @@ authors = [
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["search", "web-search", "scraping", "duckduckgo", "markdown", "html-to-markdown", "no-api-key"]
+keywords = ["search", "web-search", "mcp", "mcp-server", "scraping", "duckduckgo", "markdown", "html-to-markdown", "no-api-key"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -28,11 +28,17 @@ dependencies = [
 
 [project.scripts]
 webless = "webless.cli:main"
+webless-mcp = "webless.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/ahmedhassan456/webless"
 Repository = "https://github.com/ahmedhassan456/webless"
 Issues = "https://github.com/ahmedhassan456/webless/issues"
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=2.3.0",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.22,<0.12.0"]
@@ -44,6 +50,7 @@ module-root = "src"
 
 [dependency-groups]
 dev = [
+    "mcp>=2.3.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
 ]
