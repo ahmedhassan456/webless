@@ -72,7 +72,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--timeout", type=float, default=12.0)
     check.add_argument("--json", action="store_true")
+
+    add_mcp_arguments(
+        sub.add_parser("mcp", help='run as an MCP server (needs: pip install "webless[mcp]")')
+    )
     return parser
+
+
+def add_mcp_arguments(parser: argparse.ArgumentParser) -> None:
+    """The MCP server's options, shared by ``webless mcp`` and ``webless-mcp``."""
+    parser.add_argument(
+        "--transport", choices=("stdio", "http"), default="stdio",
+        help="stdio for clients that launch the server (default); http to serve a URL",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="interface to listen on with --transport http (default: 127.0.0.1)",
+    )
+    parser.add_argument("--port", type=int, default=8000, help="port for --transport http")
+    parser.add_argument("--path", default="/mcp", help="URL path for --transport http")
 
 
 async def run_search(args: argparse.Namespace) -> int:
@@ -164,9 +182,26 @@ async def run_doctor(args: argparse.Namespace) -> int:
 RUNNERS = {"search": run_search, "fetch": run_fetch, "doctor": run_doctor}
 
 
+def run_mcp(args: argparse.Namespace) -> int:
+    """Serve MCP. Imported here so the CLI works without the optional extra."""
+    try:
+        from .mcp_server import serve
+    except ImportError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        serve(args)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point. Network failures print a message rather than a traceback."""
     args = build_parser().parse_args(argv)
+    if args.command == "mcp":
+        # The server owns its event loop.
+        return run_mcp(args)
     runner = RUNNERS[args.command]
     try:
         return asyncio.run(runner(args))
